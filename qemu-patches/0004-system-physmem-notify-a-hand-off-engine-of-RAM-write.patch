@@ -1,0 +1,143 @@
+From baf500d78aa2e516c5f0751c3915e8b2c538dc27 Mon Sep 17 00:00:00 2001
+From: nobody <nobody@localhost>
+Date: Wed, 18 Nov 2026 16:11:30 +0900
+Subject: [PATCH 4/6] system/physmem: notify a hand-off engine of RAM writes
+
+Two changes for an engine that writes guest RAM itself:
+
+ - Writes that reach RAM outside TCG, by DMA or any other host-side
+   store, call tcg_handoff->note_write(), so the engine can invalidate
+   what it has cached for those pages. Nothing changes while no engine
+   is active.
+
+ - physical_memory_test_and_clear_dirty_ranges() clears the dirty bits
+   of several sorted, non-overlapping ranges in one RAMBlock and reports
+   the change once for their enclosing range. The engine uses it to
+   re-protect only the pages TCG wrote, instead of scanning all of RAM.
+
+Ported from the QEMU integration of Hybrid Hypervisor in Virtual Intel
+Mac. Hybrid Hypervisor was invented by Sam Henri Gold (developer of
+Light Touch, https://github.com/samhenrigold). Virtual Intel Mac is by
+nfzerox.
+
+Source commit: https://github.com/nfzerox/VirtualIntelMacOnAppleSilicon/commit/0c29f1f0fcaff59fdb6721f7ffa8b4a8c8decb65
+Files, under Source/vendor/qemu/ at that commit:
+  system/physmem.c
+  include/system/physmem.h
+
+Originally-by: Sam Henri Gold <49251320+samhenrigold@users.noreply.github.com>
+Originally-by: nfzerox <nfzerox@protonmail.com>
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ include/system/physmem.h |  9 ++++++++
+ system/physmem.c         | 47 +++++++++++++++++++++++++++++++++++-----
+ 2 files changed, 51 insertions(+), 5 deletions(-)
+
+diff --git a/include/system/physmem.h b/include/system/physmem.h
+index c47b378025..8f161f1e6a 100644
+--- a/include/system/physmem.h
++++ b/include/system/physmem.h
+@@ -94,6 +94,15 @@ uint64_t physical_memory_test_and_clear_dirty(ram_addr_t start,
+                                               unsigned client,
+                                               unsigned long *bmap);
+ 
++/* Sorted, nonempty ranges within ONE RAMBlock. Clears only those bitmaps,
++ * then synchronizes TCG's TLBs once for their enclosing range. */
++typedef struct RAMDirtyRange {
++    ram_addr_t start, length;
++} RAMDirtyRange;
++uint64_t physical_memory_test_and_clear_dirty_ranges(const RAMDirtyRange *ranges,
++                                                     size_t count,
++                                                     unsigned client);
++
+ DirtyBitmapSnapshot *
+ physical_memory_snapshot_and_clear_dirty(MemoryRegion *mr, hwaddr offset,
+                                          hwaddr length, unsigned client);
+diff --git a/system/physmem.c b/system/physmem.c
+index a7300bb9d9..9b17b82fa9 100644
+--- a/system/physmem.c
++++ b/system/physmem.c
+@@ -19,6 +19,7 @@
+ 
+ #include "qemu/osdep.h"
+ #include "exec/page-vary.h"
++#include "accel/tcg/handoff.h"
+ #include "qapi/error.h"
+ 
+ #include "qemu/cutils.h"
+@@ -1068,10 +1069,11 @@ void physical_memory_set_dirty_range(ram_addr_t start, ram_addr_t length,
+  * @return:
+  * - Number of dirty guest pages found within [start, start + length).
+  */
+-uint64_t physical_memory_test_and_clear_dirty(ram_addr_t start,
+-                                              ram_addr_t length,
+-                                              unsigned client,
+-                                              unsigned long *bmap)
++static uint64_t physical_memory_test_and_clear_dirty_internal(ram_addr_t start,
++                                                              ram_addr_t length,
++                                                              unsigned client,
++                                                              unsigned long *bmap,
++                                                              bool notify)
+ {
+     DirtyMemoryBlocks *blocks;
+     unsigned long end, page, start_page;
+@@ -1117,13 +1119,45 @@ uint64_t physical_memory_test_and_clear_dirty(ram_addr_t start,
+         memory_region_clear_dirty_bitmap(ramblock->mr, mr_offset, mr_size);
+     }
+ 
+-    if (num_dirty) {
++    if (num_dirty && notify) {
+         physical_memory_dirty_bits_cleared(start, length);
+     }
+ 
+     return num_dirty;
+ }
+ 
++uint64_t physical_memory_test_and_clear_dirty(ram_addr_t start,
++                                              ram_addr_t length,
++                                              unsigned client,
++                                              unsigned long *bmap)
++{
++    return physical_memory_test_and_clear_dirty_internal(start, length, client,
++                                                         bmap, true);
++}
++
++uint64_t physical_memory_test_and_clear_dirty_ranges(const RAMDirtyRange *ranges,
++                                                     size_t count,
++                                                     unsigned client)
++{
++    uint64_t dirty = 0;
++
++    if (!count) {
++        return 0;
++    }
++    for (size_t i = 0; i < count; i++) {
++        assert(ranges[i].length);
++        assert(!i || ranges[i].start >= ranges[i - 1].start + ranges[i - 1].length);
++        dirty += physical_memory_test_and_clear_dirty_internal(ranges[i].start,
++                    ranges[i].length, client, NULL, false);
++    }
++    if (dirty) {
++        const RAMDirtyRange *last = &ranges[count - 1];
++        physical_memory_dirty_bits_cleared(ranges[0].start,
++                            last->start + last->length - ranges[0].start);
++    }
++    return dirty;
++}
++
+ static void physical_memory_clear_dirty_range(ram_addr_t addr, ram_addr_t length)
+ {
+     physical_memory_test_and_clear_dirty(addr, length, DIRTY_MEMORY_MIGRATION, NULL);
+@@ -3138,6 +3172,9 @@ static void invalidate_and_set_dirty(MemoryRegion *mr, hwaddr addr,
+     /* We know we're only called for RAM MemoryRegions */
+     assert(ramaddr != RAM_ADDR_INVALID);
+     addr += ramaddr;
++    if (unlikely(tcg_handoff)) {
++        tcg_handoff->note_write(addr, length, false);
++    }
+ 
+     /* No early return if dirty_log_mask is or becomes 0, because
+      * physical_memory_set_dirty_range will still call
+-- 
+2.54.0 (Apple Git-157)
+

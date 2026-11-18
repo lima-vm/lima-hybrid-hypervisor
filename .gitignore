@@ -1,0 +1,6 @@
+# Output of build.sh
+/_output/
+# Output of hack/benchmark.sh
+/bench-out/
+*.log
+.DS_Store

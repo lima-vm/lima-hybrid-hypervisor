@@ -1,0 +1,373 @@
+From c106c0055b79c772437db32e41962489ce1e54ce Mon Sep 17 00:00:00 2001
+From: nobody <nobody@localhost>
+Date: Wed, 18 Nov 2026 16:11:29 +0900
+Subject: [PATCH 1/6] tcg: add hand-off interface and guarded translation
+ blocks
+
+Add the interface an external x86 engine uses to take over TCG vCPUs:
+TcgHandoffOps, EXCP_HANDOFF, and CF_HANDOFF_GUARD. No engine is
+registered by this patch, so TCG behaviour is unchanged.
+
+A guarded TB records the exact guest bytes it was translated from, so
+that an engine's stores that bypass TCG's notdirty path cannot leave a
+stale block in use. The recorded bytes live in extra space placed after
+the TB by tcg_tb_alloc(), which now takes the number of extra bytes.
+tb_gen_code() reports through *reused when it discards a translation
+in favour of one already published.
+
+Ported from the QEMU integration of Hybrid Hypervisor in Virtual Intel
+Mac. Hybrid Hypervisor was invented by Sam Henri Gold (developer of
+Light Touch, https://github.com/samhenrigold). Virtual Intel Mac is by
+nfzerox.
+
+Source commit: https://github.com/nfzerox/VirtualIntelMacOnAppleSilicon/commit/0c29f1f0fcaff59fdb6721f7ffa8b4a8c8decb65
+Files, under Source/vendor/qemu/ at that commit:
+  include/accel/tcg/handoff.h
+  include/exec/tcg-handoff-code.h
+  accel/tcg/translate-all.c
+  accel/tcg/translator.c
+  tcg/tcg.c
+  include/exec/cpu-common.h
+  include/exec/translation-block.h
+
+Originally-by: Sam Henri Gold <49251320+samhenrigold@users.noreply.github.com>
+Originally-by: nfzerox <nfzerox@protonmail.com>
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ accel/tcg/internal-common.h      |  2 +-
+ accel/tcg/translate-all.c        | 20 +++++++++----
+ accel/tcg/translator.c           | 50 ++++++++++++++++++++++++++++++++
+ include/accel/tcg/handoff.h      | 43 +++++++++++++++++++++++++++
+ include/exec/cpu-common.h        |  1 +
+ include/exec/tcg-handoff-code.h  | 32 ++++++++++++++++++++
+ include/exec/translation-block.h |  1 +
+ include/tcg/tcg.h                |  2 +-
+ tcg/tcg.c                        |  4 +--
+ 9 files changed, 145 insertions(+), 10 deletions(-)
+ create mode 100644 include/accel/tcg/handoff.h
+ create mode 100644 include/exec/tcg-handoff-code.h
+
+diff --git a/accel/tcg/internal-common.h b/accel/tcg/internal-common.h
+index 853d1b51ee..eefad5a378 100644
+--- a/accel/tcg/internal-common.h
++++ b/accel/tcg/internal-common.h
+@@ -47,7 +47,7 @@ static inline bool cpu_plugin_mem_cbs_enabled(const CPUState *cpu)
+ #endif
+ }
+ 
+-TranslationBlock *tb_gen_code(CPUState *cpu, TCGTBCPUState s);
++TranslationBlock *tb_gen_code(CPUState *cpu, TCGTBCPUState s, bool *reused);
+ void page_init(void);
+ void tb_htable_init(void);
+ void tb_reset_jump(TranslationBlock *tb, int n);
+diff --git a/accel/tcg/translate-all.c b/accel/tcg/translate-all.c
+index ea8257935e..805ec5f9af 100644
+--- a/accel/tcg/translate-all.c
++++ b/accel/tcg/translate-all.c
+@@ -37,6 +37,7 @@
+ #include "internal-common.h"
+ #include "tcg/perf.h"
+ #include "tcg/insn-start-words.h"
++#include "exec/tcg-handoff-code.h"
+ 
+ TBContext tb_ctx;
+ 
+@@ -258,7 +259,7 @@ static int setjmp_gen_code(CPUArchState *env, TranslationBlock *tb,
+ }
+ 
+ /* Called with mmap_lock held for user mode emulation.  */
+-TranslationBlock *tb_gen_code(CPUState *cpu, TCGTBCPUState s)
++TranslationBlock *tb_gen_code(CPUState *cpu, TCGTBCPUState s, bool *reused)
+ {
+     CPUArchState *env = cpu_env(cpu);
+     TranslationBlock *tb, *existing_tb;
+@@ -268,6 +269,7 @@ TranslationBlock *tb_gen_code(CPUState *cpu, TCGTBCPUState s)
+     int64_t ti;
+     void *host_pc;
+ 
++    *reused = false;
+     assert_memory_lock();
+     qemu_thread_jit_write();
+ 
+@@ -286,7 +288,8 @@ TranslationBlock *tb_gen_code(CPUState *cpu, TCGTBCPUState s)
+ 
+  buffer_overflow:
+     assert_no_pages_locked();
+-    tb = tcg_tb_alloc(tcg_ctx);
++    tb = tcg_tb_alloc(tcg_ctx, (s.cflags & CF_HANDOFF_GUARD) ?
++                      sizeof(TcgHandoffCode) : 0);
+     if (unlikely(!tb)) {
+         /*
+          * Flush must be done.  Always exit the cpu loop so that the
+@@ -318,6 +321,11 @@ TranslationBlock *tb_gen_code(CPUState *cpu, TCGTBCPUState s)
+     tcg_ctx->guest_mo = cpu->cc->tcg_ops->guest_default_memory_order;
+ 
+  restart_translate:
++    if (s.cflags & CF_HANDOFF_GUARD) {
++        TcgHandoffCode *code = tcg_handoff_code(tb);
++        memset(code, 0, sizeof(*code));
++        code->consistent = true;
++    }
+     trace_translate_block(tb, s.pc, tb->tc.ptr);
+ 
+     gen_code_size = setjmp_gen_code(env, tb, s.pc, host_pc, &max_insns, &ti);
+@@ -529,10 +537,10 @@ TranslationBlock *tb_gen_code(CPUState *cpu, TCGTBCPUState s)
+ 
+     /* if the TB already exists, discard what we just translated */
+     if (unlikely(existing_tb != tb)) {
+-        uintptr_t orig_aligned = (uintptr_t)gen_code_buf;
+-
+-        orig_aligned -= ROUND_UP(sizeof(*tb), qemu_icache_linesize);
+-        qatomic_set(&tcg_ctx->code_gen_ptr, (void *)orig_aligned);
++        /* The guarded-code metadata lies between the TB and gen_code_buf:
++         * roll back to the TB itself to release both. */
++        *reused = true;
++        qatomic_set(&tcg_ctx->code_gen_ptr, (void *)tb);
+         tcg_tb_remove(tb);
+         return existing_tb;
+     }
+diff --git a/accel/tcg/translator.c b/accel/tcg/translator.c
+index 2083f4285a..7180390a4c 100644
+--- a/accel/tcg/translator.c
++++ b/accel/tcg/translator.c
+@@ -23,6 +23,51 @@
+ #include "internal-common.h"
+ #include "disas/disas.h"
+ #include "tb-internal.h"
++#include "exec/tcg-handoff-code.h"
++
++static void handoff_record_code(DisasContextBase *db, vaddr pc,
++                                const void *data, size_t length)
++{
++    if (unlikely(db->tb->cflags & CF_HANDOFF_GUARD)) {
++        TcgHandoffCode *code = tcg_handoff_code(db->tb);
++        const uint8_t *bytes = data;
++        uint64_t offset = pc - db->pc_first;
++
++        if (offset > TCG_HANDOFF_CODE_LIMIT ||
++            length > TCG_HANDOFF_CODE_LIMIT - offset) {
++            code->consistent = false;
++            return;
++        }
++        for (size_t i = 0; i < length; i++) {
++            size_t at = offset + i;
++            uint8_t mask = 1u << (at & 7);
++            if ((code->fetched[at / 8] & mask) &&
++                code->bytes[at] != bytes[i]) {
++                code->consistent = false;
++            }
++            code->bytes[at] = bytes[i];
++            code->fetched[at / 8] |= mask;
++        }
++    }
++}
++
++static void handoff_finish_code(TranslationBlock *tb)
++{
++    if (unlikely(tb->cflags & CF_HANDOFF_GUARD)) {
++        TcgHandoffCode *code = tcg_handoff_code(tb);
++        if (tb->size > TCG_HANDOFF_CODE_LIMIT) {
++            code->consistent = false;
++            return;
++        }
++        for (size_t i = 0; i < tb->size; i++) {
++            if (!(code->fetched[i / 8] & (1u << (i & 7)))) {
++                code->consistent = false;
++                break;
++            }
++        }
++        code->length = tb->size;
++    }
++}
+ 
+ #ifndef CONFIG_USER_ONLY
+ static void set_can_do_io(DisasContextBase *db, bool val)
+@@ -269,6 +314,7 @@ void translator_loop(CPUState *cpu, TranslationBlock *tb, int *max_insns,
+     /* May be used by disas_log or plugin callbacks. */
+     tb->size = db->pc_next - db->pc_first;
+     tb->icount = db->num_insns;
++    handoff_finish_code(tb);
+ 
+     if (plugin_enabled) {
+         plugin_gen_tb_end(cpu, db->num_insns);
+@@ -526,6 +572,7 @@ uint8_t translator_ldub(CPUArchState *env, DisasContextBase *db, vaddr pc)
+         val = cpu_ldb_code_mmu(env, pc, oi, 0);
+         record_save(db, pc, &val, sizeof(val));
+     }
++    handoff_record_code(db, pc, &val, sizeof(val));
+     return val;
+ }
+ 
+@@ -539,6 +586,7 @@ uint16_t translator_lduw_end(CPUArchState *env, DisasContextBase *db,
+         val = cpu_ldw_code_mmu(env, pc, oi, 0);
+         record_save(db, pc, &val, sizeof(val));
+     }
++    handoff_record_code(db, pc, &val, sizeof(val));
+     if (endian & MO_BSWAP) {
+         val = bswap16(val);
+     }
+@@ -555,6 +603,7 @@ uint32_t translator_ldl_end(CPUArchState *env, DisasContextBase *db,
+         val = cpu_ldl_code_mmu(env, pc, oi, 0);
+         record_save(db, pc, &val, sizeof(val));
+     }
++    handoff_record_code(db, pc, &val, sizeof(val));
+     if (endian & MO_BSWAP) {
+         val = bswap32(val);
+     }
+@@ -571,6 +620,7 @@ uint64_t translator_ldq_end(CPUArchState *env, DisasContextBase *db,
+         val = cpu_ldq_code_mmu(env, pc, oi, 0);
+         record_save(db, pc, &val, sizeof(val));
+     }
++    handoff_record_code(db, pc, &val, sizeof(val));
+     if (endian & MO_BSWAP) {
+         val = bswap64(val);
+     }
+diff --git a/include/accel/tcg/handoff.h b/include/accel/tcg/handoff.h
+new file mode 100644
+index 0000000000..616f3fa4bc
+--- /dev/null
++++ b/include/accel/tcg/handoff.h
+@@ -0,0 +1,43 @@
++/*
++ * Lets another x86 engine take a TCG vCPU's instructions, and give single ones
++ * back. See target/i386/tcg/system/hvdbt.c. NULL unless that is built and asked
++ * for. Guarded fallback quanta also visit the block-selection/completion hooks.
++ *
++ * Originally from Virtual Intel Mac:
++ * https://github.com/nfzerox/VirtualIntelMacOnAppleSilicon/blob/0c29f1f0fcaff59fdb6721f7ffa8b4a8c8decb65/Source/vendor/qemu/include/accel/tcg/handoff.h
++ * Hybrid Hypervisor was invented by Sam Henri Gold (developer of Light Touch,
++ * https://github.com/samhenrigold). Virtual Intel Mac is by nfzerox.
++ * Copyright (c) 2026 nfzerox
++ *
++ * SPDX-License-Identifier: GPL-2.0-or-later
++ */
++#ifndef ACCEL_TCG_HANDOFF_H
++#define ACCEL_TCG_HANDOFF_H
++
++#include "exec/cpu-common.h"
++#include "exec/vaddr.h"
++#include "hw/core/cpu.h"
++
++typedef struct TcgHandoffOps {
++    /* A normal TB is missing for this state: should it run elsewhere instead? */
++    bool (*want_engine)(CPUState *cpu, vaddr pc, uint32_t flags);
++    /* Preserve exact requested steps; otherwise select a guarded TCG block
++     * or request the normal EXCP_HANDOFF path before looking up a TB. */
++    uint32_t (*select_cflags)(CPUState *cpu, vaddr pc, uint32_t flags,
++                              uint32_t cflags, bool exact, bool *handoff);
++    /* A guarded, unchained TB completed (also in serial atomic execution). */
++    void (*completed_tb)(CPUState *cpu, unsigned instructions);
++    /* cpu_exec returned EXCP_HANDOFF. On the vCPU thread with the BQL held. */
++    void (*run)(CPUState *cpu);
++    void (*kick)(CPUState *cpu);
++    /* RAM was written from outside the engine: by TCG's softmmu, or by DMA. */
++    void (*note_write)(uint64_t ram_addr, uint64_t len, bool by_tcg);
++} TcgHandoffOps;
++
++/* Active engine, or NULL. Set by -accel tcg,hybrid=on (accel/tcg/tcg-all.c). */
++extern const TcgHandoffOps *tcg_handoff;
++
++/* An engine built into this QEMU registers its ops at module init. */
++void tcg_handoff_register(const TcgHandoffOps *ops);
++
++#endif
+diff --git a/include/exec/cpu-common.h b/include/exec/cpu-common.h
+index c14362f780..52fa14a4e8 100644
+--- a/include/exec/cpu-common.h
++++ b/include/exec/cpu-common.h
+@@ -17,6 +17,7 @@
+ #define EXCP_HALTED     0x10003 /* cpu is halted (waiting for external event) */
+ #define EXCP_YIELD      0x10004 /* cpu wants to yield timeslice to another */
+ #define EXCP_ATOMIC     0x10005 /* stop-the-world and emulate atomic */
++#define EXCP_HANDOFF    0x10006 /* switch to the optional hybrid CPU engine */
+ 
+ #define REAL_HOST_PAGE_ALIGN(addr) ROUND_UP((addr), qemu_real_host_page_size())
+ 
+diff --git a/include/exec/tcg-handoff-code.h b/include/exec/tcg-handoff-code.h
+new file mode 100644
+index 0000000000..9d2c0f23ae
+--- /dev/null
++++ b/include/exec/tcg-handoff-code.h
+@@ -0,0 +1,32 @@
++/*
++ * Exact instruction bytes for locally guarded hybrid fallback TBs.
++ * Metadata shares the TB allocation lifetime; ordinary TBs allocate none.
++ * Originally from Virtual Intel Mac:
++ * https://github.com/nfzerox/VirtualIntelMacOnAppleSilicon/blob/0c29f1f0fcaff59fdb6721f7ffa8b4a8c8decb65/Source/vendor/qemu/include/exec/tcg-handoff-code.h
++ * Hybrid Hypervisor was invented by Sam Henri Gold (developer of Light Touch,
++ * https://github.com/samhenrigold). Virtual Intel Mac is by nfzerox.
++ * Copyright (c) 2026 nfzerox
++ *
++ * SPDX-License-Identifier: GPL-2.0-or-later
++ */
++#ifndef EXEC_TCG_HANDOFF_CODE_H
++#define EXEC_TCG_HANDOFF_CODE_H
++
++#include "exec/translation-block.h"
++
++/* x86 fallback TBs cover at most 4096 bytes, including a crossing insn. */
++#define TCG_HANDOFF_CODE_LIMIT 4096
++
++typedef struct TcgHandoffCode {
++    uint16_t length;
++    bool consistent;
++    uint8_t bytes[TCG_HANDOFF_CODE_LIMIT];
++    uint8_t fetched[TCG_HANDOFF_CODE_LIMIT / 8];
++} TcgHandoffCode;
++
++static inline TcgHandoffCode *tcg_handoff_code(TranslationBlock *tb)
++{
++    return (void *)(tb + 1);
++}
++
++#endif
+diff --git a/include/exec/translation-block.h b/include/exec/translation-block.h
+index 5a7a638b08..ac491cb025 100644
+--- a/include/exec/translation-block.h
++++ b/include/exec/translation-block.h
+@@ -85,6 +85,7 @@ struct TranslationBlock {
+ #define CF_PCREL         0x00020000 /* Opcodes in TB are PC-relative */
+ #define CF_BP_PAGE       0x00040000 /* Breakpoint present in code page */
+ #define CF_STEP_ATOMIC   0x00080000 /* Running in cpu_exec_step_atomic */
++#define CF_HANDOFF_GUARD 0x00100000 /* Check decoded bytes before hybrid reuse */
+ #define CF_CLUSTER_MASK  0xff000000 /* Top 8 bits are cluster ID */
+ #define CF_CLUSTER_SHIFT 24
+ 
+diff --git a/include/tcg/tcg.h b/include/tcg/tcg.h
+index 3dc26b919d..d22850dd95 100644
+--- a/include/tcg/tcg.h
++++ b/include/tcg/tcg.h
+@@ -654,7 +654,7 @@ static inline bool tcg_op_buf_full(void)
+ /* user-mode: mmap_lock must be held for tcg_malloc_internal. */
+ QEMU_RET_ARG_NONNULL void *tcg_malloc_internal(TCGContext *s, int size);
+ QEMU_ARG_NONNULL void tcg_pool_reset(TCGContext *s);
+-QEMU_ARG_NONNULL TranslationBlock *tcg_tb_alloc(TCGContext *s);
++QEMU_ARG_NONNULL TranslationBlock *tcg_tb_alloc(TCGContext *s, size_t extra);
+ 
+ void tcg_region_reset_all(void);
+ 
+diff --git a/tcg/tcg.c b/tcg/tcg.c
+index d19c3fb857..bf46a859df 100644
+--- a/tcg/tcg.c
++++ b/tcg/tcg.c
+@@ -1837,7 +1837,7 @@ void tcg_init(size_t tb_size, int splitwx, unsigned max_threads)
+  * Allocate TBs right before their corresponding translated code, making
+  * sure that TBs and code are on different cache lines.
+  */
+-TranslationBlock *tcg_tb_alloc(TCGContext *s)
++TranslationBlock *tcg_tb_alloc(TCGContext *s, size_t extra)
+ {
+     uintptr_t align = qemu_icache_linesize;
+     TranslationBlock *tb;
+@@ -1851,7 +1851,7 @@ TranslationBlock *tcg_tb_alloc(TCGContext *s)
+          * See tcg_region_thread_initial_alloc.
+          */
+         if (tb) {
+-            next = (void *)ROUND_UP((uintptr_t)(tb + 1), align);
++            next = (void *)ROUND_UP((uintptr_t)(tb + 1) + extra, align);
+             if (next <= s->code_gen_highwater) {
+                 qatomic_set(&s->code_gen_ptr, next);
+                 return tb;
+-- 
+2.54.0 (Apple Git-157)
+

@@ -1,0 +1,338 @@
+From 6613e07a2c120617e44ec7a3a7fd11692b38f401 Mon Sep 17 00:00:00 2001
+From: nobody <nobody@localhost>
+Date: Wed, 18 Nov 2026 16:11:30 +0900
+Subject: [PATCH 5/6] accel/tcg: hand vCPUs to an engine at translation-block
+ boundaries
+
+When tcg_handoff is set, the execution loop can stop and return
+EXCP_HANDOFF, which the MTTCG vCPU thread passes to the engine's run()
+hook. Before a translation-block lookup, the loop asks select_cflags()
+and want_engine(); guarded blocks are checked against the bytes they were
+translated from, and invalidated if they differ. A guarded block that
+runs unchained reports its instruction count through completed_tb(), in
+both the chained loop and cpu_exec_step_atomic().
+
+Stores by TCG that hit a clean page notify note_write(), and a page-table
+write probe leaves the page's clean tracking in place. cpu_exit() kicks
+the engine so a vCPU stuck in it returns promptly.
+
+Everything here is conditional on tcg_handoff, so TCG behaves as before
+when no engine is selected.
+
+Ported from the QEMU integration of Hybrid Hypervisor in Virtual Intel
+Mac. Hybrid Hypervisor was invented by Sam Henri Gold (developer of
+Light Touch, https://github.com/samhenrigold). Virtual Intel Mac is by
+nfzerox.
+
+Source commit: https://github.com/nfzerox/VirtualIntelMacOnAppleSilicon/commit/0c29f1f0fcaff59fdb6721f7ffa8b4a8c8decb65
+Files, under Source/vendor/qemu/ at that commit:
+  accel/tcg/cpu-exec.c
+  accel/tcg/cputlb.c
+  accel/tcg/tcg-accel-ops-mttcg.c
+
+Originally-by: Sam Henri Gold <49251320+samhenrigold@users.noreply.github.com>
+Originally-by: nfzerox <nfzerox@protonmail.com>
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ accel/tcg/cpu-exec.c            | 146 +++++++++++++++++++++++++++++++-
+ accel/tcg/cputlb.c              |  10 ++-
+ accel/tcg/tcg-accel-ops-mttcg.c |   4 +
+ 3 files changed, 156 insertions(+), 4 deletions(-)
+
+diff --git a/accel/tcg/cpu-exec.c b/accel/tcg/cpu-exec.c
+index 4497701486..984da1af59 100644
+--- a/accel/tcg/cpu-exec.c
++++ b/accel/tcg/cpu-exec.c
+@@ -24,6 +24,8 @@
+ #include "hw/core/cpu.h"
+ #include "accel/tcg/cpu-loop.h"
+ #include "accel/tcg/cpu-ops.h"
++#include "accel/tcg/handoff.h"
++#include "exec/tcg-handoff-code.h"
+ #include "accel/tcg/helper-retaddr.h"
+ #include "trace.h"
+ #include "disas/disas.h"
+@@ -549,6 +551,10 @@ static void cpu_exec_longjmp_cleanup(CPUState *cpu)
+     assert_no_pages_locked();
+ }
+ 
++#ifndef CONFIG_USER_ONLY
++static bool handoff_code_matches(CPUState *cpu, TranslationBlock *tb, vaddr pc);
++#endif
++
+ void cpu_exec_step_atomic(CPUState *cpu)
+ {
+     TranslationBlock *tb;
+@@ -568,6 +574,11 @@ void cpu_exec_step_atomic(CPUState *cpu)
+         /* After 1 insn, return and release the exclusive lock. */
+         s.cflags |= CF_NO_GOTO_TB | CF_NO_GOTO_PTR |
+                     CF_NOIRQ | CF_STEP_ATOMIC | 1;
++#ifndef CONFIG_USER_ONLY
++        if (unlikely(tcg_handoff)) {
++            s.cflags |= CF_HANDOFF_GUARD;
++        }
++#endif
+ 
+         /*
+          * No need to check_for_breakpoints here.
+@@ -576,11 +587,29 @@ void cpu_exec_step_atomic(CPUState *cpu)
+          * Any breakpoint for this insn will have been recognized earlier.
+          */
+ 
++#ifndef CONFIG_USER_ONLY
++ retry_atomic_lookup:
++#endif
+         tb = tb_lookup(cpu, s);
++#ifndef CONFIG_USER_ONLY
++        if (unlikely(tb && (s.cflags & CF_HANDOFF_GUARD)) &&
++            !handoff_code_matches(cpu, tb, s.pc)) {
++            tb_phys_invalidate(tb, -1);
++            tb = NULL;
++        }
++#endif
+         if (tb == NULL) {
++            bool reused;
+             mmap_lock();
+-            tb = tb_gen_code(cpu, s);
++            tb = tb_gen_code(cpu, s, &reused);
+             mmap_unlock();
++#ifndef CONFIG_USER_ONLY
++            if (unlikely(reused && (s.cflags & CF_HANDOFF_GUARD)) &&
++                !handoff_code_matches(cpu, tb, s.pc)) {
++                tb_phys_invalidate(tb, -1);
++                goto retry_atomic_lookup;
++            }
++#endif
+         }
+ 
+         cpu_exec_enter(cpu);
+@@ -588,6 +617,12 @@ void cpu_exec_step_atomic(CPUState *cpu)
+         trace_exec_tb(tb, s.pc);
+         cpu_tb_exec(cpu, tb, &tb_exit);
+         cpu_exec_exit(cpu);
++#ifndef CONFIG_USER_ONLY
++        if (tb_exit <= TB_EXIT_IDX1 &&
++            unlikely(tcg_handoff && (tb->cflags & CF_HANDOFF_GUARD))) {
++            tcg_handoff->completed_tb(cpu, tb->icount);
++        }
++#endif
+     } else {
+         cpu_exec_longjmp_cleanup(cpu);
+     }
+@@ -768,6 +803,11 @@ void tcg_kick_vcpu_thread(CPUState *cpu)
+      * CPU thread; see kvm_arch_pre_run() for example.
+      */
+     qatomic_store_release(&cpu->exit_request, true);
++#ifndef CONFIG_USER_ONLY
++    if (unlikely(tcg_handoff)) {
++        tcg_handoff->kick(cpu);
++    }
++#endif
+ 
+     /* Ensure cpu_exec will see the exit request after TCG has exited.  */
+     qatomic_store_release(&cpu->neg.icount_decr.u16.high, -1);
+@@ -895,8 +935,20 @@ static inline void cpu_loop_exec_tb(CPUState *cpu, TranslationBlock *tb,
+                                     vaddr pc, TranslationBlock **last_tb,
+                                     int *tb_exit)
+ {
++#ifndef CONFIG_USER_ONLY
++    TranslationBlock *entered_tb = tb;
++#endif
+     trace_exec_tb(tb, pc);
+     tb = cpu_tb_exec(cpu, tb, tb_exit);
++#ifndef CONFIG_USER_ONLY
++    /* Unchained control flow may return exit_tb(NULL, 0), even after
++     * executing the block. Count the input TB: guarded blocks never chain.
++     * Icount/exit-request returns before entry do not consume the budget. */
++    if (*tb_exit <= TB_EXIT_IDX1 &&
++        unlikely(tcg_handoff && (entered_tb->cflags & CF_HANDOFF_GUARD))) {
++        tcg_handoff->completed_tb(cpu, entered_tb->icount);
++    }
++#endif
+     if (*tb_exit != TB_EXIT_REQUESTED) {
+         *last_tb = tb;
+         return;
+@@ -937,6 +989,37 @@ static inline void cpu_loop_exec_tb(CPUState *cpu, TranslationBlock *tb,
+ #endif
+ }
+ 
++#ifndef CONFIG_USER_ONLY
++static bool handoff_code_matches(CPUState *cpu, TranslationBlock *tb, vaddr pc)
++{
++    const TcgHandoffCode *code = tcg_handoff_code(tb);
++    size_t offset = 0;
++
++    if (!code->consistent || code->length != tb->size) {
++        return false;
++    }
++    while (offset < code->length) {
++        void *host;
++        vaddr at = pc + offset;
++        size_t span = MIN(code->length - offset,
++                          TARGET_PAGE_SIZE - (at & ~TARGET_PAGE_MASK));
++
++        /* Use the real executable mapping, including second-page fetch
++         * permissions/faults. Never dereference guest virtual addresses. */
++        if (get_page_addr_code_hostp(cpu_env(cpu), at, &host) == -1 || !host) {
++            return false;
++        }
++        for (size_t i = 0; i < span; i++) {
++            if (qatomic_read((uint8_t *)host + i) != code->bytes[offset + i]) {
++                return false;
++            }
++        }
++        offset += span;
++    }
++    return true;
++}
++#endif
++
+ /* main execution loop */
+ 
+ static int __attribute__((noinline))
+@@ -953,6 +1036,7 @@ cpu_exec_loop(CPUState *cpu, SyncClocks *sc)
+             TranslationBlock *tb;
+             TCGTBCPUState s = cpu->cc->tcg_ops->get_tb_cpu_state(cpu);
+             s.cflags = cpu->cflags_next_tb;
++            bool exact = s.cflags != -1;
+ 
+             /*
+              * When requested, use an exact setting for cflags for the next
+@@ -966,19 +1050,75 @@ cpu_exec_loop(CPUState *cpu, SyncClocks *sc)
+             } else {
+                 cpu->cflags_next_tb = -1;
+             }
+-
++#ifndef CONFIG_USER_ONLY
++            if (unlikely(tcg_handoff)) {
++                bool handoff = false;
++                s.cflags = tcg_handoff->select_cflags(cpu, s.pc, s.flags,
++                                                     s.cflags, exact, &handoff);
++                if (handoff) {
++                    cpu->exception_index = EXCP_HANDOFF;
++                    break;
++                }
++            }
++#else
++            (void)exact;
++#endif
+             if (check_for_breakpoints(cpu, s.pc, &s.cflags)) {
+                 break;
+             }
+ 
++#ifndef CONFIG_USER_ONLY
++ retry_handoff_lookup:
++#endif
+             tb = tb_lookup(cpu, s);
++#ifndef CONFIG_USER_ONLY
++            if (unlikely(tb && (s.cflags & CF_HANDOFF_GUARD)) &&
++                !handoff_code_matches(cpu, tb, s.pc)) {
++                /* Engine stores bypass TCG's notdirty path. A decoded-byte
++                 * mismatch invalidates normally, before this TB executes. */
++                tb_phys_invalidate(tb, -1);
++                tb = NULL;
++            }
++#endif
+             if (tb == NULL) {
+                 CPUJumpCache *jc;
+                 uint32_t h;
++                bool reused;
++#ifndef CONFIG_USER_ONLY
++                if (unlikely(tcg_handoff) && s.cflags == curr_cflags(cpu)) {
++                    if (tcg_handoff->want_engine(cpu, s.pc, s.flags)) {
++                        cpu->exception_index = EXCP_HANDOFF;
++                        break;
++                    }
++                    /* Admission can arm guarded TCG on this miss. The
++                     * first block needs the same guard as every later one. */
++                    bool handoff = false;
++                    uint32_t selected = tcg_handoff->select_cflags(
++                        cpu, s.pc, s.flags, s.cflags, exact, &handoff);
++                    if (handoff) {
++                        cpu->exception_index = EXCP_HANDOFF;
++                        break;
++                    }
++                    if (selected != s.cflags) {
++                        s.cflags = selected;
++                        goto retry_handoff_lookup;
++                    }
++                }
++#endif
+ 
+                 mmap_lock();
+-                tb = tb_gen_code(cpu, s);
++                tb = tb_gen_code(cpu, s, &reused);
+                 mmap_unlock();
++#ifndef CONFIG_USER_ONLY
++                /* Concurrent translation can select an already published
++                 * TB instead of the one just decoded. Guard that exact
++                 * returned block too, before publishing a jump-cache hit. */
++                if (unlikely(reused && (s.cflags & CF_HANDOFF_GUARD)) &&
++                    !handoff_code_matches(cpu, tb, s.pc)) {
++                    tb_phys_invalidate(tb, -1);
++                    goto retry_handoff_lookup;
++                }
++#endif
+ 
+                 /*
+                  * We add the TB in the virtual pc hash table
+diff --git a/accel/tcg/cputlb.c b/accel/tcg/cputlb.c
+index dc83f3bad8..1df6f27add 100644
+--- a/accel/tcg/cputlb.c
++++ b/accel/tcg/cputlb.c
+@@ -53,6 +53,7 @@
+ #endif
+ #include "tcg/tcg-ldst.h"
+ #include "backend-ldst.h"
++#include "accel/tcg/handoff.h"
+ 
+ 
+ /* DEBUG defines, enable DEBUG_TLB_LOG to log to the CPU_LOG_MMU target */
+@@ -1340,6 +1341,9 @@ static void notdirty_write(CPUState *cpu, vaddr mem_vaddr, unsigned size,
+     ram_addr_t ram_addr = mem_vaddr + full->xlat_offset;
+ 
+     trace_memory_notdirty_write_access(mem_vaddr, ram_addr, size);
++    if (unlikely(tcg_handoff)) {
++        tcg_handoff->note_write(ram_addr, size, true);
++    }
+ 
+     if (!physical_memory_get_dirty_flag(ram_addr, DIRTY_MEMORY_CODE)) {
+         tb_invalidate_phys_range_fast(cpu, ram_addr, size, retaddr);
+@@ -1444,7 +1448,11 @@ int probe_access_full_mmu(CPUArchState *env, vaddr addr, int size,
+     /* Handle clean RAM pages.  */
+     if (unlikely(flags & TLB_NOTDIRTY)) {
+         int dirtysize = size == 0 ? 1 : size;
+-        notdirty_write(env_cpu(env), addr, dirtysize, *pfull, 0);
++        /* A page-table write probe is not a committed store. Keep the
++         * engine's clean/write-protected tracking until a real write. */
++        if (likely(!tcg_handoff)) {
++            notdirty_write(env_cpu(env), addr, dirtysize, *pfull, 0);
++        }
+         flags &= ~TLB_NOTDIRTY;
+     }
+ 
+diff --git a/accel/tcg/tcg-accel-ops-mttcg.c b/accel/tcg/tcg-accel-ops-mttcg.c
+index e7edd1945f..dc5124f912 100644
+--- a/accel/tcg/tcg-accel-ops-mttcg.c
++++ b/accel/tcg/tcg-accel-ops-mttcg.c
+@@ -34,6 +34,7 @@
+ #include "hw/core/boards.h"
+ #include "accel/tcg/cpu-loop.h"
+ #include "tcg/startup.h"
++#include "accel/tcg/handoff.h"
+ #include "tcg-accel-ops.h"
+ #include "tcg-accel-ops-mttcg.h"
+ 
+@@ -105,6 +106,9 @@ static void *mttcg_cpu_thread_fn(void *arg)
+                  * reset by another thread by the time we arrive here.
+                  */
+                 break;
++            case EXCP_HANDOFF:
++                tcg_handoff->run(cpu);
++                break;
+             case EXCP_ATOMIC:
+                 bql_unlock();
+                 cpu_exec_step_atomic(cpu);
+-- 
+2.54.0 (Apple Git-157)
+

@@ -1,0 +1,36 @@
+#!/bin/bash
+# SPDX-FileCopyrightText: Copyright The Lima Authors
+# SPDX-License-Identifier: Apache-2.0
+#
+# qemu-system-x86_64.hybrid: QEMU with Hybrid Hypervisor, for Lima (https://github.com/lima-vm/lima-hybrid-hypervisor).
+# Use it with: QEMU_SYSTEM_X86_64=/path/to/qemu-system-x86_64.hybrid limactl start --arch=x86_64 --vm-type=qemu ...
+# It runs the qemu-system-x86_64 next to it, with that directory first in PATH. It adds hybrid=on to the
+# "-accel tcg,..." argument, and replaces Lima's default CPU model ("max", possibly with feature flags such as
+# "max,-avx512vl,-pdpe1gb") with one the engine accepts (no AVX, SMAP or PKU). Other CPU models are passed
+# through unchanged.
+# Environment:
+#   LIMA_HYBRID_HYPERVISOR_CPU   CPU model used in place of "max..." (default: Nehalem)
+#   LIMA_HYBRID_HYPERVISOR=0     do not enable the engine (plain TCG with the same CPU model, for comparison)
+set -eu
+here=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
+export PATH="$here:$PATH"
+cpu=${LIMA_HYBRID_HYPERVISOR_CPU:-Nehalem}
+enable=${LIMA_HYBRID_HYPERVISOR:-1}
+args=()
+prev=
+for a in "$@"; do
+	orig=$a
+	case $prev in
+	-accel)
+		if [ "$enable" != 0 ]; then
+			case $a in tcg | tcg,*) case ,$a, in *,hybrid=*) ;; *) a=$a,hybrid=on ;; esac ;; esac
+		fi
+		;;
+	-cpu)
+		case $a in max | max,*) a=$cpu ;; esac
+		;;
+	esac
+	args+=("$a")
+	prev=$orig
+done
+exec "$here/qemu-system-x86_64" ${args[@]+"${args[@]}"}

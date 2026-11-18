@@ -1,0 +1,107 @@
+From 2db91b864ac7ed28d6980bcc7458c84cb4597e58 Mon Sep 17 00:00:00 2001
+From: nobody <nobody@localhost>
+Date: Wed, 18 Nov 2026 16:11:29 +0900
+Subject: [PATCH 2/6] accel/tcg: add -accel tcg,hybrid=on to select a
+ registered engine
+
+An engine built into QEMU registers its TcgHandoffOps at module init.
+The new "hybrid" property of the TCG accelerator selects it. It defaults
+to off, and asking for it fails with a clear error when no engine was
+built in or in user-mode emulation. The accelerator owns tcg_handoff,
+the pointer that the hooks test, so it is set only here.
+
+Based on the QEMU integration of Hybrid Hypervisor in Virtual Intel Mac;
+this replaces its LC_HVDBT environment switch. Hybrid Hypervisor was
+invented by Sam Henri Gold (developer of Light Touch,
+https://github.com/samhenrigold). Virtual Intel Mac is by nfzerox.
+
+Source commit: https://github.com/nfzerox/VirtualIntelMacOnAppleSilicon/commit/0c29f1f0fcaff59fdb6721f7ffa8b4a8c8decb65
+Files, under Source/vendor/qemu/ at that commit:
+  target/i386/tcg/system/hvdbt.c
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ accel/tcg/tcg-all.c | 46 +++++++++++++++++++++++++++++++++++++++++++++
+ 1 file changed, 46 insertions(+)
+
+diff --git a/accel/tcg/tcg-all.c b/accel/tcg/tcg-all.c
+index bbc733a707..2011ad6040 100644
+--- a/accel/tcg/tcg-all.c
++++ b/accel/tcg/tcg-all.c
+@@ -46,6 +46,7 @@
+ #include "accel/accel-cpu-ops.h"
+ #include "accel/tcg/cpu-ops.h"
+ #include "internal-common.h"
++#include "accel/tcg/handoff.h"
+ 
+ 
+ struct TCGState {
+@@ -53,6 +54,7 @@ struct TCGState {
+ 
+     OnOffAuto mttcg_enabled;
+     bool one_insn_per_tb;
++    bool hybrid;
+     int splitwx_enabled;
+     unsigned long tb_size;
+ };
+@@ -243,6 +245,45 @@ static void tcg_set_splitwx(Object *obj, bool value, Error **errp)
+     s->splitwx_enabled = value;
+ }
+ 
++#ifndef CONFIG_USER_ONLY
++/* Active hybrid engine, or NULL. Set by -accel tcg,hybrid=on. */
++const TcgHandoffOps *tcg_handoff;
++
++/* The hybrid engine registers its ops at startup, if it is built in. */
++static const TcgHandoffOps *tcg_handoff_registered;
++
++void tcg_handoff_register(const TcgHandoffOps *ops)
++{
++    tcg_handoff_registered = ops;
++}
++#endif
++
++static bool tcg_get_hybrid(Object *obj, Error **errp)
++{
++    TCGState *s = TCG_STATE(obj);
++    return s->hybrid;
++}
++
++static void tcg_set_hybrid(Object *obj, bool value, Error **errp)
++{
++    TCGState *s = TCG_STATE(obj);
++
++#ifndef CONFIG_USER_ONLY
++    if (value && !tcg_handoff_registered) {
++        error_setg(errp, "this QEMU was built without the hybrid engine "
++                   "(configure with -Dhvdbt_engine=<path>)");
++        return;
++    }
++    tcg_handoff = value ? tcg_handoff_registered : NULL;
++#else
++    if (value) {
++        error_setg(errp, "the hybrid engine is not available in user mode");
++        return;
++    }
++#endif
++    s->hybrid = value;
++}
++
+ static bool tcg_get_one_insn_per_tb(Object *obj, Error **errp)
+ {
+     TCGState *s = TCG_STATE(obj);
+@@ -282,6 +323,11 @@ static void tcg_accel_class_init(ObjectClass *oc, const void *data)
+     object_class_property_set_description(oc, "split-wx",
+         "Map jit pages into separate RW and RX regions");
+ 
++    object_class_property_add_bool(oc, "hybrid",
++        tcg_get_hybrid, tcg_set_hybrid);
++    object_class_property_set_description(oc, "hybrid",
++        "Run x86 code in the hybrid engine (needs a build with -Dhvdbt_engine)");
++
+     object_class_property_add_bool(oc, "one-insn-per-tb",
+                                    tcg_get_one_insn_per_tb,
+                                    tcg_set_one_insn_per_tb);
+-- 
+2.54.0 (Apple Git-157)
+

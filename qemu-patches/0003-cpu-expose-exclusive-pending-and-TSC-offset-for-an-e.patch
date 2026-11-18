@@ -1,0 +1,100 @@
+From 897807a2b94a9f6ccdd4e528b47e9abfefc1ff20 Mon Sep 17 00:00:00 2001
+From: nobody <nobody@localhost>
+Date: Wed, 18 Nov 2026 16:11:29 +0900
+Subject: [PATCH 3/6] cpu: expose exclusive-pending and TSC offset for an
+ engine
+
+An engine that runs x86 code outside TCG needs two things from QEMU:
+
+ - cpu_exclusive_pending(), so that its execution loop yields to QEMU's
+   exclusive operations (start_exclusive()) as TCG's loop does;
+ - cpu_get_ticks_offset(), the host-counter offset applied to RDTSC, so
+   the engine's time stamp counter matches TCG's across discontinuities.
+
+Ported from the QEMU integration of Hybrid Hypervisor in Virtual Intel
+Mac. Hybrid Hypervisor was invented by Sam Henri Gold (developer of
+Light Touch, https://github.com/samhenrigold). Virtual Intel Mac is by
+nfzerox.
+
+Source commit: https://github.com/nfzerox/VirtualIntelMacOnAppleSilicon/commit/0c29f1f0fcaff59fdb6721f7ffa8b4a8c8decb65
+Files, under Source/vendor/qemu/ at that commit:
+  cpu-common.c
+  system/cpu-timers.c
+
+Originally-by: Sam Henri Gold <49251320+samhenrigold@users.noreply.github.com>
+Originally-by: nfzerox <nfzerox@protonmail.com>
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ cpu-common.c                |  6 ++++++
+ include/hw/core/cpu.h       |  1 +
+ include/system/cpu-timers.h |  1 +
+ system/cpu-timers.c         | 12 ++++++++++++
+ 4 files changed, 20 insertions(+)
+
+diff --git a/cpu-common.c b/cpu-common.c
+index adb76b3a78..38bac38bcb 100644
+--- a/cpu-common.c
++++ b/cpu-common.c
+@@ -246,6 +246,12 @@ void end_exclusive(void)
+     qemu_mutex_unlock(&qemu_cpu_list_lock);
+ }
+ 
++/* A non-TCG execution loop must also yield to QEMU's exclusive operations. */
++bool cpu_exclusive_pending(void)
++{
++    return qatomic_read(&pending_cpus) != 0;
++}
++
+ /* Wait for exclusive ops to finish, and begin cpu execution.  */
+ void cpu_exec_start(CPUState *cpu)
+ {
+diff --git a/include/hw/core/cpu.h b/include/hw/core/cpu.h
+index 5b7c330047..858402ddfc 100644
+--- a/include/hw/core/cpu.h
++++ b/include/hw/core/cpu.h
+@@ -1128,6 +1128,7 @@ void process_queued_cpu_work(CPUState *cpu);
+  * Record that a CPU has started execution and can be interrupted with
+  * cpu_exit.
+  */
++bool cpu_exclusive_pending(void);
+ void cpu_exec_start(CPUState *cpu);
+ 
+ /**
+diff --git a/include/system/cpu-timers.h b/include/system/cpu-timers.h
+index a1abed0d7a..7cfcb21f8d 100644
+--- a/include/system/cpu-timers.h
++++ b/include/system/cpu-timers.h
+@@ -29,6 +29,7 @@ void cpu_disable_ticks(void);
+  * cpu_get_ticks() uses units of the host CPU cycle counter.
+  */
+ int64_t cpu_get_ticks(void);
++int64_t cpu_get_ticks_offset(void);
+ 
+ /*
+  * Returns the monotonic time elapsed in VM, i.e.,
+diff --git a/system/cpu-timers.c b/system/cpu-timers.c
+index 9919b46230..10561173ea 100644
+--- a/system/cpu-timers.c
++++ b/system/cpu-timers.c
+@@ -71,6 +71,18 @@ int64_t cpu_get_ticks(void)
+     return ticks;
+ }
+ 
++int64_t cpu_get_ticks_offset(void)
++{
++    int64_t offset;
++
++    qemu_spin_lock(&timers_state.vm_clock_lock);
++    /* Apply the same host-counter discontinuity accounting as RDTSC. */
++    cpu_get_ticks_locked();
++    offset = timers_state.cpu_ticks_offset;
++    qemu_spin_unlock(&timers_state.vm_clock_lock);
++    return offset;
++}
++
+ int64_t cpu_get_clock_locked(void)
+ {
+     int64_t time;
+-- 
+2.54.0 (Apple Git-157)
+

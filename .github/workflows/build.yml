@@ -1,0 +1,42 @@
+# SPDX-FileCopyrightText: Copyright The Lima Authors
+# SPDX-License-Identifier: Apache-2.0
+
+# Builds Hybrid Hypervisor and the patched QEMU (build.sh) on Apple silicon.
+name: build
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+  workflow_dispatch:
+
+permissions: {}
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    name: build
+    runs-on: macos-26
+    timeout-minutes: 60
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Install build dependencies
+        run: brew install glib pixman libslirp ninja pkgconf
+
+      - name: Build
+        run: ./build.sh
+
+      - name: Show the build output
+        run: |
+          ls -l _output/bin
+          cat _output/share/doc/lima-hybrid-hypervisor/SOURCES
+          _output/bin/qemu-system-x86_64 --version
